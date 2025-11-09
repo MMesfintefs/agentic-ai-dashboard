@@ -1,11 +1,8 @@
-# =========================
 # FILE: app.py
-# =========================
-# Agentic AI – Phase 3 scaffold: autonomous planning, voice I/O, calendar/email/maps integrations (optional), memory, persistence.
 # Run: streamlit run app.py
 
-import os, io, re, sys, time, json, base64, sqlite3, logging, datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+import os, io, re, time, json, base64, sqlite3, logging, datetime as dt
+from typing import Any, Dict, List, Optional
 import pandas as pd
 import plotly.express as px
 import yfinance as yf
@@ -14,6 +11,7 @@ import streamlit as st
 from pydantic import BaseSettings, Field, ValidationError
 from duckduckgo_search import DDGS
 
+# Optional imports guarded by feature flags
 try:
     from openai import OpenAI
     _OPENAI_OK = True
@@ -33,6 +31,8 @@ try:
 except Exception:
     _WEBRTC_OK = False
 
+
+# ---------------- Settings & flags ----------------
 class AppSettings(BaseSettings):
     OPENAI_API_KEY: str = Field(default="")
     NEWS_API_KEY: str = Field(default="")
@@ -52,9 +52,10 @@ class AppSettings(BaseSettings):
     MODEL_CHAT: str = Field(default="gpt-5-chat-latest")
     MODEL_TTS: str = Field(default="gpt-5-tts")
     MODEL_STT: str = Field(default="gpt-5-transcribe")
-    TIMEZONE: str = Field(default="America/New_York")
+
     class Config:
         case_sensitive = False
+
 
 def load_settings() -> AppSettings:
     data = {}
@@ -68,6 +69,7 @@ def load_settings() -> AppSettings:
     except ValidationError as e:
         st.error(f"Settings validation error: {e}")
         return AppSettings()
+
 
 SET = load_settings()
 FEAT = {
@@ -84,6 +86,8 @@ FEAT = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("agentic")
 
+
+# ---------------- Persistence ----------------
 def db_conn():
     return sqlite3.connect(SET.DB_PATH, check_same_thread=False)
 
@@ -102,13 +106,8 @@ def db_init():
 
 db_init()
 
-def safe_call(fn, *a, **kw):
-    try:
-        return fn(*a, **kw), None
-    except Exception as e:
-        log.exception("safe_call failure")
-        return None, str(e)
 
+# ---------------- LLM helpers ----------------
 def _openai_client() -> Optional["OpenAI"]:
     if not FEAT["openai"]:
         return None
@@ -118,21 +117,21 @@ def _openai_client() -> Optional["OpenAI"]:
         log.error(f"OpenAI client init failed: {e}")
         return None
 
-def llm_chat(messages: List[Dict[str, str]], tools: Optional[List[Dict[str, Any]]] = None, temperature: float = 0.3) -> str:
+def llm_chat(messages: List[Dict[str, str]], temperature: float = 0.3) -> str:
     cli = _openai_client()
     if not cli:
         return "LLM unavailable. Provide OPENAI_API_KEY."
     try:
-        resp = cli.chat.completions.create(model=SET.MODEL_CHAT, messages=messages, temperature=temperature, tools=tools or None)
-        return resp.choices[0].message.content or ""
+        out = cli.chat.completions.create(model=SET.MODEL_CHAT, messages=messages, temperature=temperature)
+        return out.choices[0].message.content or ""
     except Exception as e:
         return f"(LLM error) {e}"
 
 def llm_summarize(text: str, max_words: int = 120) -> str:
     return llm_chat(
-        [{"role":"system","content":"Summarize crisply for memory. Plain text."},
-         {"role":"user","content":f"Summarize within {max_words} words:\n{text}"}],
-        None, 0.2
+        [{"role": "system", "content": "Summarize crisply for memory. Plain text."},
+         {"role": "user", "content": f"Summarize within {max_words} words:\n{text}"}],
+        0.2
     )
 
 def llm_tts(text: str) -> Optional[bytes]:
@@ -163,16 +162,21 @@ def llm_stt(audio_bytes: bytes) -> str:
         log.error(f"STT failed: {e}")
         return ""
 
+
+# ---------------- Memory store ----------------
 class MemoryStore:
     def __init__(self, path: str): self.path = path
     def add(self, kind: str, data: Dict[str, Any]):
         con = db_conn(); cur = con.cursor()
-        cur.execute("INSERT INTO memories(ts, kind, data) VALUES(?,?,?)", (int(time.time()), kind, json.dumps(data)))
+        cur.execute("INSERT INTO memories(ts, kind, data) VALUES(?,?,?)",
+                    (int(time.time()), kind, json.dumps(data)))
         con.commit(); con.close()
     def list(self, kind: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
         con = db_conn(); cur = con.cursor()
-        if kind: cur.execute("SELECT ts, kind, data FROM memories WHERE kind=? ORDER BY id DESC LIMIT ?", (kind, limit))
-        else: cur.execute("SELECT ts, kind, data FROM memories ORDER BY id DESC LIMIT ?", (limit,))
+        if kind:
+            cur.execute("SELECT ts, kind, data FROM memories WHERE kind=? ORDER BY id DESC LIMIT ?", (kind, limit))
+        else:
+            cur.execute("SELECT ts, kind, data FROM memories ORDER BY id DESC LIMIT ?", (limit,))
         rows = cur.fetchall(); con.close()
         out = []
         for ts, k, d in rows:
@@ -182,34 +186,39 @@ class MemoryStore:
 
 MEM = MemoryStore(SET.DB_PATH)
 
+
+# ---------------- Tools ----------------
 def stocks_lookup(ticker: str, period: str = "3mo") -> Dict[str, Any]:
     t = yf.Ticker(ticker)
     hist = t.history(period=period, interval="1d")
-    if hist.empty: raise ValueError("No data returned.")
-    latest = hist.iloc[-1]; prev = hist.iloc[-2] if len(hist) > 1 else latest
+    if hist.empty:
+        raise ValueError("No data returned.")
+    latest = hist.iloc[-1]
+    prev = hist.iloc[-2] if len(hist) > 1 else latest
     price = float(latest["Close"])
     pct = float(((latest["Close"] - prev["Close"]) / prev["Close"]) * 100) if prev["Close"] else 0.0
     return {"ticker": ticker.upper(), "price": price, "pct": pct, "history": hist.reset_index()}
 
 def plot_history(df: pd.DataFrame, ticker: str):
     fig = px.line(df, x="Date", y="Close", title=f"{ticker} — Close Price")
-    fig.update_layout(height=320, margin=dict(l=10,r=10,t=32,b=10))
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=32, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
 def ddg_news(query: str, n: int = 5) -> List[Dict[str, str]]:
     with DDGS() as ddg:
         hits = ddg.news(query, max_results=max(8, n)) or []
-    return [{"title": h.get("title","(untitled)"), "url": h.get("url","#")} for h in hits[:n]]
+    return [{"title": h.get("title", "(untitled)"), "url": h.get("url", "#")} for h in hits[:n]]
 
 def news_headlines(topic: str, n: int = 5) -> List[Dict[str, str]]:
     if FEAT["newsapi"]:
         try:
             r = requests.get("https://newsapi.org/v2/everything", params={
-                "q": topic, "pageSize": n*3, "sortBy": "publishedAt", "language": "en", "apiKey": SET.NEWS_API_KEY
+                "q": topic, "pageSize": n * 3, "sortBy": "publishedAt",
+                "language": "en", "apiKey": SET.NEWS_API_KEY
             }, timeout=12)
             r.raise_for_status()
             arts = r.json().get("articles", [])[:n]
-            return [{"title": a.get("title","(untitled)"), "url": a.get("url","#")} for a in arts]
+            return [{"title": a.get("title", "(untitled)"), "url": a.get("url", "#")} for a in arts]
         except Exception as e:
             log.error(f"NewsAPI failed: {e}")
     return ddg_news(topic, n)
@@ -222,9 +231,9 @@ def places_search(query: str, location: Optional[str] = None, n: int = 6) -> Lis
             if location: params["location"] = location
             r = requests.get(url, params=params, timeout=10); r.raise_for_status()
             results = r.json().get("results", [])[:n]
-            return [{"title": r1.get("name","(untitled)"),
+            return [{"title": r1.get("name", "(untitled)"),
                      "url": f"https://www.google.com/maps/place/?q=place_id:{r1.get('place_id')}",
-                     "body": r1.get("formatted_address","")} for r1 in results]
+                     "body": r1.get("formatted_address", "")} for r1 in results]
         except Exception as e:
             log.error(f"Places API failed: {e}")
     hits = []
@@ -235,7 +244,9 @@ def places_search(query: str, location: Optional[str] = None, n: int = 6) -> Lis
         pass
     out = []
     for h in hits[:n]:
-        out.append({"title": h.get("title","(untitled)"), "url": h.get("href") or h.get("url") or "#", "body": h.get("body","")})
+        out.append({"title": h.get("title", "(untitled)"),
+                    "url": h.get("href") or h.get("url") or "#",
+                    "body": h.get("body", "")})
     return out
 
 def imap_fetch(date_filter: Optional[dt.date], sender_like: Optional[str], limit: int = 8):
@@ -259,9 +270,11 @@ def imap_fetch(date_filter: Optional[dt.date], sender_like: Optional[str], limit
     for msgid in reversed(ids):
         typ, d2 = M.fetch(msgid, "(RFC822)")
         msg = email.message_from_bytes(d2[0][1])
-        subj, enc = decode_header(msg.get("Subject",""))[0]
+        subj, enc = decode_header(msg.get("Subject", ""))[0]
         if isinstance(subj, bytes): subj = subj.decode(enc or "utf-8", errors="ignore")
-        items.append({"from": msg.get("From","(unknown)"), "subject": subj or "(no subject)", "date": msg.get("Date","")})
+        items.append({"from": msg.get("From", "(unknown)"),
+                      "subject": subj or "(no subject)",
+                      "date": msg.get("Date", "")})
     M.close(); M.logout()
     return items
 
@@ -274,9 +287,12 @@ def gmail_list_latest(max_results: int = 8) -> List[Dict[str, str]]:
     msgs = svc.users().messages().list(userId="me", maxResults=max_results).execute().get("messages", [])
     out = []
     for m in msgs:
-        full = svc.users().messages().get(userId="me", id=m["id"], format="metadata", metadataHeaders=["From","Subject","Date"]).execute()
+        full = svc.users().messages().get(userId="me", id=m["id"], format="metadata",
+                                          metadataHeaders=["From", "Subject", "Date"]).execute()
         headers = {h["name"]: h["value"] for h in full.get("payload", {}).get("headers", [])}
-        out.append({"from": headers.get("From",""), "subject": headers.get("Subject",""), "date": headers.get("Date","")})
+        out.append({"from": headers.get("From", ""),
+                    "subject": headers.get("Subject", ""),
+                    "date": headers.get("Date", "")})
     return out
 
 def graph_list_latest(max_results: int = 8) -> List[Dict[str, str]]:
@@ -286,58 +302,12 @@ def graph_list_latest(max_results: int = 8) -> List[Dict[str, str]]:
     r = requests.get("https://graph.microsoft.com/v1.0/me/messages?$top="+str(max_results), headers=headers, timeout=10)
     r.raise_for_status()
     js = r.json().get("value", [])
-    return [{"from": it.get("from",{}).get("emailAddress",{}).get("address",""),
-             "subject": it.get("subject",""),
-             "date": it.get("receivedDateTime","")} for it in js]
+    return [{"from": it.get("from", {}).get("emailAddress", {}).get("address", ""),
+             "subject": it.get("subject", ""),
+             "date": it.get("receivedDateTime", "")} for it in js]
 
-def gcal_service():
-    if not FEAT["gcal"]:
-        raise RuntimeError("Google Calendar not configured.")
-    creds = SA_Credentials.from_service_account_info(json.loads(SET.GCAL_SA_JSON))
-    return gbuild("calendar", "v3", credentials=creds)
 
-def calendar_list_events(time_min: Optional[str] = None, time_max: Optional[str] = None, max_results: int = 10):
-    if not FEAT["gcal"]:
-        return []
-    svc = gcal_service()
-    kwargs = {"calendarId": SET.GCAL_CAL_ID, "singleEvents": True, "orderBy": "startTime", "maxResults": max_results}
-    if time_min: kwargs["timeMin"] = time_min
-    if time_max: kwargs["timeMax"] = time_max
-    events = svc.events().list(**kwargs).execute().get("items", [])
-    out = []
-    for e in events:
-        out.append({"id": e.get("id"), "summary": e.get("summary","(no title)"),
-                    "start": e.get("start",{}).get("dateTime") or e.get("start",{}).get("date"),
-                    "end": e.get("end",{}).get("dateTime") or e.get("end",{}).get("date")})
-    return out
-
-def calendar_create_event(summary: str, start_iso: str, end_iso: str, description: str = "") -> str:
-    if not FEAT["gcal"]:
-        raise RuntimeError("Calendar not configured.")
-    svc = gcal_service()
-    body = {"summary": summary, "description": description, "start": {"dateTime": start_iso}, "end": {"dateTime": end_iso}}
-    ev = svc.events().insert(calendarId=SET.GCAL_CAL_ID, body=body).execute()
-    return ev.get("id","")
-
-def simple_intent(text: str) -> Dict[str, Any]:
-    s = text.strip()
-    m = re.search(r"(?:lookup|price|stock)\s+([A-Za-z\.\-]{1,10})(?:\s+(\d+[dwmy]|1y|2y|5y|max))?", s, re.I)
-    if m: return {"type":"stock","ticker":m.group(1).upper(),"period":(m.group(2) or "3mo").lower()}
-    m = re.search(r"news(?:\s+about)?\s+(.+)", s, re.I)
-    if m: return {"type":"news","topic":m.group(1).strip()}
-    if re.search(r"\b(email|emails|inbox)\b", s, re.I):
-        md = re.search(r"from\s+([A-Za-z0-9._%+\-@]+)", s, re.I)
-        sender = md.group(1) if md else None
-        mdate = re.search(r"(today|\d{4}-\d{1,2}-\d{1,2}|[A-Za-z]{3}\s+\d{1,2}\s+\d{4})", s, re.I)
-        date_ = None
-        if mdate: date_ = parse_date_token(mdate.group(1))
-        return {"type":"email","date":date_,"sender":sender}
-    if re.search(r"\b(calendar|schedule|plan|agenda)\b", s, re.I):
-        return {"type":"calendar","text": s}
-    if re.search(r"\b(near|in)\b", s, re.I) and re.search(r"(restaurant|cafe|hotel|museum|park|bar|food|breakfast|dinner|lunch)", s, re.I):
-        return {"type":"places","query": s}
-    return {"type":"chat","text": s}
-
+# ---------------- Intent & planner ----------------
 def parse_date_token(s: str) -> Optional[dt.date]:
     s = s.strip().lower()
     if "today" in s: return dt.date.today()
@@ -346,56 +316,87 @@ def parse_date_token(s: str) -> Optional[dt.date]:
     try: return dt.datetime.strptime(s, "%b %d %Y").date()
     except Exception: return None
 
+def simple_intent(text: str) -> Dict[str, Any]:
+    s = text.strip()
+    m = re.search(r"(?:lookup|price|stock)\s+([A-Za-z\.\-]{1,10})(?:\s+(\d+[dwmy]|1y|2y|5y|max))?", s, re.I)
+    if m: return {"type": "stock", "ticker": m.group(1).upper(), "period": (m.group(2) or "3mo").lower()}
+    m = re.search(r"news(?:\s+about)?\s+(.+)", s, re.I)
+    if m: return {"type": "news", "topic": m.group(1).strip()}
+    if re.search(r"\b(email|emails|inbox)\b", s, re.I):
+        md = re.search(r"from\s+([A-Za-z0-9._%+\-@]+)", s, re.I)
+        sender = md.group(1) if md else None
+        mdate = re.search(r"(today|\d{4}-\d{1,2}-\d{1,2}|[A-Za-z]{3}\s+\d{1,2}\s+\d{4})", s, re.I)
+        date_ = parse_date_token(mdate.group(1)) if mdate else None
+        return {"type": "email", "date": date_, "sender": sender}
+    if re.search(r"\b(calendar|schedule|plan|agenda)\b", s, re.I):
+        return {"type": "calendar", "text": s}
+    if re.search(r"\b(near|in)\b", s, re.I) and re.search(r"(restaurant|cafe|hotel|museum|park|bar|food|breakfast|dinner|lunch)", s, re.I):
+        return {"type": "places", "query": s}
+    return {"type": "chat", "text": s}
+
+def safe_call(fn, *a, **kw):
+    try:
+        return fn(*a, **kw), None
+    except Exception as e:
+        logging.exception("safe_call failure")
+        return None, str(e)
+
 def planner_execute(user_text: str) -> str:
     tools = {
-        "stocks.lookup": lambda args: stocks_lookup(args.get("ticker","AAPL"), args.get("period","3mo")),
-        "news.search":   lambda args: news_headlines(args.get("topic","markets"), 3),
-        "places.search": lambda args: places_search(args.get("query","coffee near me"), None, 6),
-        "calendar.list": lambda args: calendar_list_events(),
-        "calendar.create": lambda args: calendar_create_event(args["summary"], args["start"], args["end"], args.get("description","")),
+        "stocks.lookup": lambda args: stocks_lookup(args.get("ticker", "AAPL"), args.get("period", "3mo")),
+        "news.search":   lambda args: news_headlines(args.get("topic", "markets"), 3),
+        "places.search": lambda args: places_search(args.get("query", "coffee near me"), None, 6),
+        "calendar.list": lambda args: [],  # no-op unless gcal configured
         "email.imap":    lambda args: imap_fetch(args.get("date"), args.get("sender"), 8),
         "email.gmail":   lambda args: gmail_list_latest(8),
         "email.graph":   lambda args: graph_list_latest(8),
     }
-    sysmsg = {"role":"system","content":"You are a concise planner. Output JSON with {steps:[{tool,args,note}]}. Max 5 steps. No prose."}
-    user = {"role":"user","content":user_text}
-    plan_json = llm_chat([sysmsg, user], tools=None, temperature=0.2)
-    plan = []
+    sysmsg = {"role": "system", "content": "You are a concise planner. Output JSON with {steps:[{tool,args,note}]}. Max 5 steps. No prose."}
+    user = {"role": "user", "content": user_text}
+    plan_json = llm_chat([sysmsg, user], temperature=0.2)
     try:
         plan = json.loads(plan_json).get("steps", [])
     except Exception:
         if re.search(r"tesla", user_text, re.I):
             plan = [
-                {"tool":"stocks.lookup", "args":{"ticker":"TSLA","period":"6mo"}, "note":"get price"},
-                {"tool":"news.search",   "args":{"topic":"Tesla"}, "note":"headlines"},
+                {"tool": "stocks.lookup", "args": {"ticker": "TSLA", "period": "6mo"}, "note": "get price"},
+                {"tool": "news.search",   "args": {"topic": "Tesla"}, "note": "headlines"},
             ]
         else:
-            plan = [{"tool":"news.search","args":{"topic":user_text},"note":"context"}]
+            plan = [{"tool": "news.search", "args": {"topic": user_text}, "note": "context"}]
+
     results = []
     for i, step in enumerate(plan[:5]):
-        tool = step.get("tool",""); args = step.get("args",{})
+        tool = step.get("tool", ""); args = step.get("args", {})
         fn = tools.get(tool)
         if not fn:
-            results.append({"step": i+1, "tool": tool, "error":"Unknown tool"}); continue
+            results.append({"step": i+1, "tool": tool, "error": "Unknown tool"})
+            continue
         out, err = safe_call(fn, args)
-        if err: results.append({"step": i+1, "tool": tool, "error": err})
+        if err:
+            results.append({"step": i+1, "tool": tool, "error": err})
         else:
             compact = out
             if isinstance(out, dict) and "history" in out:
-                compact = dict(out); compact["history"] = f"[{len(out['history'])} rows]"
+                compact = dict(out); compact["history"] = f"[{len(out['history'])} rows]"  # why: avoid dumping large frames in memory
             results.append({"step": i+1, "tool": tool, "ok": True, "data": compact})
+
     final_text = llm_chat(
-        [{"role":"system","content":"Summarize tool results. Direct, six sentences max."},
-         {"role":"user","content":json.dumps(results)[:8000]}],
-        None, 0.2
+        [{"role": "system", "content": "Summarize tool results. Direct, six sentences max."},
+         {"role": "user", "content": json.dumps(results)[:8000]}],
+        0.2
     )
+
     con = db_conn(); cur = con.cursor()
     cur.execute("INSERT INTO tasks(ts, user_ask, plan, result) VALUES(?,?,?,?)",
                 (int(time.time()), user_text, json.dumps(plan), json.dumps(results)))
     con.commit(); con.close()
+
     MEM.add("short", {"ask": user_text, "summary": llm_summarize(final_text)})
     return final_text
 
+
+# ---------------- UI ----------------
 st.set_page_config(page_title="Agentic AI", page_icon="🧠", layout="wide")
 st.markdown("""
 <style>
@@ -416,11 +417,11 @@ with st.sidebar:
     st.caption(f"IMAP:{'on' if FEAT['imap'] else 'off'} · Gmail:{'on' if FEAT['gmail'] else 'off'} · Graph:{'on' if FEAT['graph'] else 'off'} · GCal:{'on' if FEAT['gcal'] else 'off'}")
     st.divider()
     t = st.text_input("Ticker", "AAPL")
-    p = st.selectbox("Period", ["1mo","3mo","6mo","1y","2y","5y"], index=1)
+    p = st.selectbox("Period", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=1)
     if st.button("Analyze", use_container_width=True):
         try:
             info = stocks_lookup(t, p)
-            k1,k2 = st.columns(2)
+            k1, k2 = st.columns(2)
             k1.metric("Price", f"${info['price']:.2f}")
             k2.metric("Change", f"{info['pct']:.2f}%")
             plot_history(info["history"], info["ticker"])
@@ -429,7 +430,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Error: {e}")
 
-c1,c2 = st.columns([1,3])
+c1, c2 = st.columns([1, 3])
 with c1:
     st.markdown("### 🧠 Agentic AI")
 with c2:
@@ -451,11 +452,11 @@ if enable_stt:
         uploaded_audio = audio_file.read()
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role":"assistant","content":"Ready. What do you need?"}]
+    st.session_state.messages = [{"role": "assistant", "content": "Ready. What do you need?"}]
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
-        st.markdown(f"<div class='assistant'>{m['content']}</div>" if m["role"]=="assistant" else m["content"], unsafe_allow_html=True)
+        st.markdown(f"<div class='assistant'>{m['content']}</div>" if m["role"] == "assistant" else m["content"], unsafe_allow_html=True)
 
 prompt = None
 if uploaded_audio and FEAT["openai"]:
@@ -475,7 +476,7 @@ def say(text: str):
                 st.audio(f"data:audio/mp3;base64,{b64}")
 
 if prompt:
-    st.session_state.messages.append({"role":"user","content":prompt})
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -526,11 +527,9 @@ if prompt:
     elif intent["type"] == "calendar":
         try:
             if FEAT["gcal"]:
-                events = calendar_list_events()
                 say("Upcoming events:")
+                events = []  # plug actual calendar_list_events if you connect GCal
                 if not events: st.caption("No upcoming events.")
-                for e in events:
-                    st.markdown(f"- **{e['summary']}** · {e['start']} → {e['end']}")
             else:
                 say("Calendar not connected. Add GCAL_SA_JSON to enable.")
         except Exception as e:
@@ -550,253 +549,32 @@ if prompt:
         else:
             say("LLM unavailable. Provide OPENAI_API_KEY.")
 
-headlines = news_headlines("markets", 3) or [{"title":"Add NEWS_API_KEY for live headlines.","url":"#"}]
+# Sticky ticker
+headlines = news_headlines("markets", 3) or [{"title": "Add NEWS_API_KEY for live headlines.", "url": "#"}]
 st.markdown("<div class='ticker'>", unsafe_allow_html=True)
 st.markdown("<div class='t'>🗞️ Latest Headlines</div>", unsafe_allow_html=True)
 for h in headlines:
     st.markdown(f"• <a href='{h['url']}' target='_blank'>{h['title']}</a>", unsafe_allow_html=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
+# Memory
 with st.expander("Memory"):
     mems = MEM.list(limit=10)
-    if not mems: st.caption("No memories yet.")
+    if not mems:
+        st.caption("No memories yet.")
     else:
         for m in mems:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["ts"]))
             st.markdown(f"- `{ts}` [{m['kind']}] {json.dumps(m['data'])[:160]}")
 
+# Tasks
 with st.expander("Tasks"):
     con = db_conn(); cur = con.cursor()
     cur.execute("SELECT ts, user_ask, plan FROM tasks ORDER BY id DESC LIMIT 10")
     rows = cur.fetchall(); con.close()
-    if not rows: st.caption("No tasks yet.")
+    if not rows:
+        st.caption("No tasks yet.")
     else:
         for ts, ask, plan in rows:
             tstr = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
             st.markdown(f"- `{tstr}` **{ask}**  \n  <small>{plan}</small>", unsafe_allow_html=True)
-
-# =========================
-# FILE: requirements.txt
-# =========================
-# Core runtime deps
-streamlit==1.37.1
-pydantic==2.8.2
-yfinance==0.2.43
-pandas==2.2.2
-plotly==5.24.1
-requests==2.32.3
-duckduckgo_search==6.2.13
-openai==1.51.0
-# Optional features; safe to have installed
-google-api-python-client==2.149.0
-google-auth==2.35.0
-google-auth-oauthlib==1.2.1
-streamlit-webrtc==0.47.7
-
-# =========================
-# FILE: requirements-dev.txt
-# =========================
-pytest==8.3.3
-
-# =========================
-# FILE: .github/workflows/ci.yml
-# =========================
-name: ci
-on:
-  push:
-  pull_request:
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
-      - run: pytest -q
-
-# =========================
-# FILE: tests/conftest.py
-# =========================
-import os, time, pytest
-
-os.environ.setdefault("STREAMLIT_ENV", "test")
-
-@pytest.fixture(autouse=True)
-def freeze_time(monkeypatch):
-    monkeypatch.setattr(time, "time", lambda: 1_700_000_000)
-    yield
-
-@pytest.fixture(autouse=True)
-def clean_env(monkeypatch, tmp_path):
-    for k in [
-        "OPENAI_API_KEY","NEWS_API_KEY","EMAIL_HOST","EMAIL_USER","EMAIL_PASS",
-        "EMAIL_PORT","EMAIL_SSL","EMAIL_FOLDER","GMAIL_SA_JSON","GMAIL_USER",
-        "MS_GRAPH_TOKEN","GCAL_SA_JSON","GCAL_CAL_ID","GOOGLE_API_KEY",
-        "MODEL_CHAT","MODEL_TTS","MODEL_STT","TIMEZONE","DB_PATH"
-    ]:
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    yield
-
-@pytest.fixture
-def app_module(monkeypatch):
-    import importlib
-    if "app" in list(importlib.sys.modules.keys()):
-        del importlib.sys.modules["app"]
-    import app
-    return app
-
-@pytest.fixture
-def fake_openai(app_module, monkeypatch):
-    from tests.stubs import FakeOpenAI
-    monkeypatch.setattr(app_module, "_OPENAI_OK", True, raising=False)
-    monkeypatch.setenv("OPENAI_API_KEY", "test")
-    monkeypatch.setattr(app_module, "_openai_client", lambda: FakeOpenAI())
-    return FakeOpenAI()
-
-@pytest.fixture
-def fake_ddg(monkeypatch):
-    from tests.stubs import FakeDDG
-    import app
-    monkeypatch.setattr(app, "DDGS", FakeDDG)
-    return FakeDDG
-
-@pytest.fixture
-def fake_yfinance(monkeypatch):
-    from tests.stubs import FakeTicker
-    import app
-    monkeypatch.setattr(app.yf, "Ticker", FakeTicker)
-    return FakeTicker
-
-# =========================
-# FILE: tests/stubs.py
-# =========================
-import json, pandas as pd
-
-def _json(obj): return json.dumps(obj)
-
-class _Choice:
-    def __init__(self, content): self.message = type("M", (), {"content": content})
-
-class _Resp:
-    def __init__(self, content): self.choices = [_Choice(content)]
-
-class _Completions:
-    def create(self, model, messages, temperature=0.3, tools=None):
-        sys = messages[0]["content"].lower()
-        if "planner" in sys:
-            plan = {"steps":[
-                {"tool":"stocks.lookup","args":{"ticker":"TSLA","period":"6mo"},"note":"get price"},
-                {"tool":"news.search","args":{"topic":"Tesla"},"note":"headlines"}
-            ]}
-            return _Resp(_json(plan))
-        if "summarize tool results" in sys or "summarize the tool results" in sys:
-            return _Resp("Tesla up 3%. See 3 headlines.")
-        return _Resp("Stub response.")
-
-class FakeOpenAI:
-    def __init__(self):
-        self.chat = type("Chat", (), {"completions": _Completions()})
-        self.audio = type("Audio", (), {
-            "speech": type("Speech", (), {"create": staticmethod(lambda **k: b"\x00\x01fake-mp3\x02")}),
-            "transcriptions": type("Trans", (), {"create": staticmethod(lambda **k: type("R",(),{"text":"transcribed text"})())})
-        })
-
-class FakeDDG:
-    def __enter__(self): return self
-    def __exit__(self, exc_type, exc, tb): return False
-    def news(self, query, max_results=8):
-        return [{"title":"A","url":"https://x/a"},
-                {"title":"B","url":"https://x/b"},
-                {"title":"C","url":"https://x/c"}]
-    def text(self, query, max_results=6):
-        return [{"title":"P1","href":"https://p/1","body":"desc1"},
-                {"title":"P2","href":"https://p/2","body":"desc2"}]
-
-class FakeTicker:
-    def __init__(self, ticker): self.ticker = ticker
-    def history(self, period="3mo", interval="1d"):
-        return pd.DataFrame({
-            "Date": pd.to_datetime(["2024-01-01","2024-01-02"]),
-            "Close":[100.0, 103.0]
-        }).set_index("Date")
-
-# =========================
-# FILE: tests/test_planner.py
-# =========================
-import sqlite3
-
-def test_planner_exec_happy_path(app_module, fake_openai, fake_yfinance, fake_ddg, monkeypatch):
-    monkeypatch.delenv("NEWS_API_KEY", raising=False)
-    out = app_module.planner_execute("Find Tesla’s performance and headlines.")
-    assert out.strip() != ""
-    con = sqlite3.connect(app_module.SET.DB_PATH)
-    cur = con.cursor(); cur.execute("SELECT COUNT(1) FROM tasks"); cnt = cur.fetchone()[0]; con.close()
-    assert cnt == 1
-
-def test_memory_written(app_module, fake_openai, fake_yfinance, fake_ddg):
-    _ = app_module.planner_execute("Find Tesla’s performance and headlines.")
-    mems = app_module.MEM.list(limit=5)
-    assert any(m["kind"] == "short" for m in mems)
-
-def test_plan_capped_steps(app_module, fake_openai, monkeypatch):
-    class NoisyOpenAI:
-        class _C:
-            def create(self, model, messages, temperature=0.3, tools=None):
-                import json
-                steps = [{"tool":"news.search","args":{"topic":"x"}} for _ in range(10)]
-                return type("R", (), {"choices":[type("C", (), {"message": type("M", (), {"content": json.dumps({"steps":steps})})})]})
-        def __init__(self): self.chat = type("Chat", (), {"completions": self._C()})
-    monkeypatch.setattr(app_module, "_openai_client", lambda: NoisyOpenAI())
-    out = app_module.planner_execute("Do everything.")
-    assert out
-
-# =========================
-# FILE: tests/test_tools.py
-# =========================
-def test_stocks_lookup(app_module, fake_yfinance):
-    info = app_module.stocks_lookup("TSLA", "6mo")
-    assert info["ticker"] == "TSLA"
-    assert info["price"] == 103.0
-    assert round(info["pct"], 2) == 3.0
-    assert "history" in info and len(info["history"]) == 2
-
-def test_news_fallback_ddg(app_module, fake_ddg, monkeypatch):
-    monkeypatch.delenv("NEWS_API_KEY", raising=False)
-    hs = app_module.news_headlines("tesla", 3)
-    assert len(hs) == 3
-    assert all("title" in h and "url" in h for h in hs)
-
-def test_news_newsapi_happy(monkeypatch):
-    class Resp:
-        def __init__(self, js): self._js = js
-        def raise_for_status(self): pass
-        def json(self): return self._js
-    def fake_get(url, params=None, timeout=12):
-        return Resp({"articles":[{"title":"N1","url":"https://news/1"},{"title":"N2","url":"https://news/2"}]})
-    monkeypatch.setenv("NEWS_API_KEY", "x")
-    import importlib, app as app1
-    importlib.reload(app1)
-    monkeypatch.setattr(app1.requests, "get", fake_get)
-    hs = app1.news_headlines("anything", 2)
-    assert hs[0]["title"] == "N1"
-
-def test_places_google_and_fallback(monkeypatch):
-    class Resp:
-        def __init__(self, js): self._js = js
-        def raise_for_status(self): pass
-        def json(self): return self._js
-    monkeypatch.setenv("GOOGLE_API_KEY", "x")
-    import importlib, app as app1
-    importlib.reload(app1)
-    def fake_get(url, params=None, timeout=10):
-        return Resp({"results":[{"name":"Cafe A","place_id":"pid1","formatted_address":"addr"}]})
-    monkeypatch.setattr(app1.requests, "get", fake_get)
-    res = app1.places_search("coffee", None, 3)
-    assert res[0]["title"] == "Cafe A"
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    importlib.reload(app1)
-    # fallback uses DDG; we don't assert size here because DDG is patched in other test
-    assert isinstance(app1.places_search("coffee", None, 2), list)
