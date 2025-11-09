@@ -1,16 +1,9 @@
-# FILE: requirements.txt
-# Core runtime deps
 streamlit==1.37.1
 pydantic==2.8.2
+pydantic-settings==2.2.1
 yfinance==0.2.43
 pandas==2.2.2
 plotly==5.24.1
 requests==2.32.3
 duckduckgo_search==6.2.13
 openai==1.51.0
-
-# Optional integrations (harmless if present without keys)
-google-api-python-client==2.149.0
-google-auth==2.35.0
-google-auth-oauthlib==1.2.1
-streamlit-webrtc==0.47.7
