@@ -1,0 +1,26 @@
+# --- secrets (NEVER commit) ---
+.streamlit/secrets.toml
+
+# --- local state / artifacts ---
+agentic_ai.db
+*.sqlite
+*.db
+
+# --- Python noise ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# --- virtual envs (if you ever use them) ---
+.venv/
+venv/
+env/
+
+# --- OS clutter ---
+.DS_Store
+Thumbs.db
