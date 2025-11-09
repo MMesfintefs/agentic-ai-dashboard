@@ -8,7 +8,8 @@ import plotly.express as px
 import yfinance as yf
 import requests
 import streamlit as st
-from pydantic import BaseSettings, Field, ValidationError
+from pydantic import Field, ValidationError
+from pydantic_settings import BaseSettings
 from duckduckgo_search import DDGS
 
 # Optional imports guarded by feature flags
